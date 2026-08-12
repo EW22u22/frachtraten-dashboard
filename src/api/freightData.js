@@ -4,6 +4,32 @@ const ENTRIES_TABLE = "freight_entries";
 const UPLOADS_TABLE = "freight_uploads";
 const MAPPING_TABLE = "freight_route_mapping";
 
+// PostgREST (die API-Schicht hinter Supabase) liefert bei .select() ohne
+// explizite Pagination standardmäßig nur bis zu einer projektweiten
+// Maximalzeilenzahl zurück (üblich: 1000) — ohne Fehlermeldung, einfach
+// stillschweigend abgeschnitten. Bei wachsendem Datenbestand (mehrere Jahre,
+// Routen, Größen, Monate, Spediteure) kann das schnell überschritten werden.
+// fetchAllRows liest deshalb in Seiten von PAGE_SIZE Zeilen, bis wirklich
+// alles geladen ist.
+const PAGE_SIZE = 1000;
+
+async function fetchAllRows(table, orderColumn) {
+  const allRows = [];
+  let from = 0;
+  // Sicherheitsgrenze, damit ein unerwarteter Serverfehler nicht zu einer
+  // Endlosschleife führt.
+  for (let page = 0; page < 1000; page++) {
+    let query = supabase.from(table).select("*").range(from, from + PAGE_SIZE - 1);
+    if (orderColumn) query = query.order(orderColumn, { ascending: true });
+    const { data, error } = await query;
+    if (error) throw error;
+    allRows.push(...(data || []));
+    if (!data || data.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+  return allRows;
+}
+
 function assertClient() {
   if (!supabase) {
     throw new Error(
@@ -19,24 +45,20 @@ function assertClient() {
 export async function loadAllData() {
   assertClient();
 
-  const [uploadsRes, entriesRes, mappingRes] = await Promise.all([
-    supabase.from(UPLOADS_TABLE).select("*").order("added_at", { ascending: true }),
-    supabase.from(ENTRIES_TABLE).select("*"),
-    supabase.from(MAPPING_TABLE).select("*"),
+  const [uploads, entriesRaw, mappingRows] = await Promise.all([
+    fetchAllRows(UPLOADS_TABLE, "added_at"),
+    fetchAllRows(ENTRIES_TABLE),
+    fetchAllRows(MAPPING_TABLE),
   ]);
 
-  if (uploadsRes.error) throw uploadsRes.error;
-  if (entriesRes.error) throw entriesRes.error;
-  if (mappingRes.error) throw mappingRes.error;
-
-  const uploads = (uploadsRes.data || []).map((u) => ({
+  const uploadsOut = uploads.map((u) => ({
     id: u.id,
     filename: u.filename,
     month: u.month,
     addedAt: u.added_at,
   }));
 
-  const entries = (entriesRes.data || []).map((e) => ({
+  const entries = entriesRaw.map((e) => ({
     id: e.id,
     uploadId: e.upload_id,
     route: e.route,
@@ -47,11 +69,11 @@ export async function loadAllData() {
   }));
 
   const routeMapping = {};
-  (mappingRes.data || []).forEach((r) => {
+  mappingRows.forEach((r) => {
     routeMapping[r.route_raw] = r.route_display;
   });
 
-  return { uploads, entries, routeMapping };
+  return { uploads: uploadsOut, entries, routeMapping };
 }
 
 /**

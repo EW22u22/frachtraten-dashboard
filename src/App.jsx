@@ -5,7 +5,10 @@ import {
 } from "recharts";
 import { Upload, Trash2, Save, X, Loader2, AlertCircle, CheckCircle2, ChevronDown, Anchor, RefreshCw } from "lucide-react";
 import { loadAllData, saveBatchesToSupabase, deleteUploadFromSupabase } from "./api/freightData.js";
+import { loadScfiRates, upsertScfiRates } from "./api/scfiData.js";
+import { parseScfiFile } from "./lib/parseScfiFile.js";
 import { isSupabaseConfigured } from "./supabaseClient.js";
+import { SCFI_ROUTE_NAME, SCFI_SIZE_FACTOR, SCFI_LINE_COLOR } from "./data/scfi.js";
 
 /* ---------------------------------------------------------------------- */
 /* Constants                                                               */
@@ -69,21 +72,75 @@ function extractRouteRaw(sheetName) {
   return route || sheetName.trim();
 }
 
-function guessMonthYear(sheetNames, fallbackYear) {
+// Sucht im Text nach einer eindeutigen 4-stelligen Jahreszahl (2000–2099),
+// egal an welcher Stelle sie steht — unabhängig davon, was direkt davor/danach steht.
+function extractYearAnywhere(text) {
+  const m = (text || "").match(/\b(20\d{2})\b/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// Sucht im Text nach einem der 12 Monatsnamen, egal an welcher Stelle er steht.
+function extractMonthIndexAnywhere(text) {
+  const s = (text || "").toLowerCase();
+  for (let i = 0; i < MONTHS_DE.length; i++) {
+    if (s.includes(MONTHS_DE[i])) return i;
+  }
+  return -1;
+}
+
+// Ermittelt Monat + Jahr ausschließlich aus echten Hinweisen in der Datei selbst:
+// 1. Steht im Tabellenblattnamen ein Jahr direkt beim Monat (z.B. "China Juli 26")?
+//    -> das hat immer Vorrang.
+// 2. Steht im Tabellenblattnamen KEIN Jahr, aber der Dateiname enthält eindeutig
+//    ein Jahr (z.B. "Raten Juli 1.Hälfte 2026.xlsx")? -> das Jahr aus dem Dateinamen
+//    für diesen Monat übernehmen.
+// 3. Liefert kein Tabellenblatt ein sicheres Jahr, aber Dateiname nennt eindeutig
+//    Monat + Jahr? -> das als einzigen Kandidaten nehmen.
+// Die aktuell im Dashboard ausgewählte Jahres-Ansicht spielt bewusst KEINE Rolle,
+// damit ein hochgeladener Januar/Februar-2026-Import niemals fälschlich unter
+// einem anderen Jahr landen kann, nur weil dort gerade ein anderes Jahr offen war.
+function guessMonthYear(sheetNames, filename) {
   const counts = {};
+
+  let filenameYear = extractYearAnywhere(filename);
+  if (filenameYear === null) {
+    const fm = (filename || "").match(MONTH_RE);
+    if (fm && fm[2]) {
+      let y = parseInt(fm[2], 10);
+      if (y < 100) y += 2000;
+      filenameYear = y;
+    }
+  }
+
   sheetNames.forEach((name) => {
     const m = name.match(MONTH_RE);
     if (!m) return;
     const idx = MONTHS_DE.indexOf(m[1].toLowerCase());
     if (idx < 0) return;
+
     let year = m[2] ? parseInt(m[2], 10) : null;
-    if (year === null) year = parseInt(fallbackYear, 10);
-    if (year < 100) year += 2000;
+    if (year !== null && year < 100) year += 2000;
+
+    if (year === null && filenameYear !== null) {
+      year = filenameYear;
+    }
+
+    if (year === null) return; // Jahr nicht sicher bestimmbar -> nicht mitzählen, lieber manuell wählen lassen
+
     const key = `${year}-${String(idx + 1).padStart(2, "0")}`;
     counts[key] = (counts[key] || 0) + 1;
   });
+
   let best = null, bestCount = 0;
   Object.entries(counts).forEach(([k, c]) => { if (c > bestCount) { best = k; bestCount = c; } });
+
+  if (!best && filenameYear !== null) {
+    const filenameMonthIdx = extractMonthIndexAnywhere(filename);
+    if (filenameMonthIdx >= 0) {
+      best = `${filenameYear}-${String(filenameMonthIdx + 1).padStart(2, "0")}`;
+    }
+  }
+
   return best;
 }
 
@@ -163,9 +220,9 @@ function parseSheetBlocks(rows) {
   return blocks;
 }
 
-function parseWorkbook(workbook, fallbackYear) {
+function parseWorkbook(workbook, filename) {
   const sheetNames = workbook.SheetNames.filter((n) => !/lcl/i.test(n));
-  const guessedMonth = guessMonthYear(sheetNames, fallbackYear);
+  const guessedMonth = guessMonthYear(sheetNames, filename);
   const routeCandidates = [];
   sheetNames.forEach((name) => {
     const ws = workbook.Sheets[name];
@@ -235,6 +292,16 @@ export default function FrachtratenDashboard() {
 
   const fileInputRef = useRef(null);
 
+  // --- SCFI-Referenzwerte: komplett eigener State, unabhängig vom Frachtraten-State ---
+  const [scfiByYear, setScfiByYear] = useState({});
+  const [scfiLoading, setScfiLoading] = useState(true);
+  const [scfiSaving, setScfiSaving] = useState(false);
+  const [scfiError, setScfiError] = useState(null);
+  const [scfiSuccessMsg, setScfiSuccessMsg] = useState(null);
+  const [scfiLastUpdated, setScfiLastUpdated] = useState(null);
+  const [scfiRowCount, setScfiRowCount] = useState(0);
+  const scfiFileInputRef = useRef(null);
+
   /* ---- gemeinsamen Datenstand aus Supabase laden ---- */
   const loadFromSupabase = useCallback(async () => {
     setLoading(true);
@@ -261,6 +328,57 @@ export default function FrachtratenDashboard() {
   useEffect(() => {
     loadFromSupabase();
   }, [loadFromSupabase]);
+
+  /* ---- SCFI-Referenzwerte laden: komplett eigenständig, betrifft die
+         Frachtraten-Ladefunktion (loadFromSupabase) in keiner Weise ---- */
+  const loadScfi = useCallback(async () => {
+    setScfiLoading(true);
+    setScfiError(null);
+    try {
+      const { byYear, lastUpdatedAt, rowCount } = await loadScfiRates();
+      setScfiByYear(byYear);
+      setScfiLastUpdated(lastUpdatedAt);
+      setScfiRowCount(rowCount);
+    } catch (e) {
+      setScfiError(e?.message || "SCFI-Daten konnten nicht geladen werden.");
+    } finally {
+      setScfiLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadScfi();
+  }, [loadScfi]);
+
+  useEffect(() => {
+    if (scfiSuccessMsg) {
+      const t = setTimeout(() => setScfiSuccessMsg(null), 5000);
+      return () => clearTimeout(t);
+    }
+  }, [scfiSuccessMsg]);
+
+  const handleScfiFile = async (fileList) => {
+    const file = fileList && fileList[0];
+    if (!file) return;
+    setScfiError(null);
+    setScfiSuccessMsg(null);
+    setScfiSaving(true);
+    try {
+      const rows = await parseScfiFile(file);
+      const { upserted } = await upsertScfiRates(rows);
+      await loadScfi();
+      setScfiSuccessMsg(`SCFI-Daten aktualisiert: ${upserted} Monatswerte aus "${file.name}" übernommen — für alle Benutzer sichtbar.`);
+    } catch (e) {
+      setScfiError(e?.message || "SCFI-Datei konnte nicht verarbeitet werden.");
+    } finally {
+      setScfiSaving(false);
+    }
+  };
+
+  const onScfiDrop = (e) => {
+    e.preventDefault();
+    if (e.dataTransfer.files && e.dataTransfer.files.length) handleScfiFile(e.dataTransfer.files);
+  };
 
   useEffect(() => {
     if (toast) {
@@ -309,6 +427,13 @@ export default function FrachtratenDashboard() {
         e.month.slice(0, 4) === selectedYear
     );
     const spedSet = Array.from(new Set(relevant.map((e) => e.spediteur)));
+
+    // SCFI-Referenzlinie: ausschließlich für den Standort "China", zusätzlich
+    // zu den bestehenden Spediteur-Linien — verändert deren Berechnung nicht.
+    const showScfi = selectedRoute.trim().toLowerCase() === SCFI_ROUTE_NAME.toLowerCase();
+    const scfiYearValues = showScfi ? scfiByYear[selectedYear] : null;
+    const scfiFactor = SCFI_SIZE_FACTOR[selectedSize] ?? 1;
+
     const data = [];
     for (let m = 0; m < 12; m++) {
       const monthNum = String(m + 1).padStart(2, "0");
@@ -319,10 +444,17 @@ export default function FrachtratenDashboard() {
           .map((e) => e.price);
         point[sp] = vals.length ? Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 100) / 100 : null;
       });
+      if (showScfi) {
+        const rawScfi = scfiYearValues ? scfiYearValues[m] : null;
+        point.SCFI =
+          rawScfi === null || rawScfi === undefined ? null : Math.round(rawScfi * scfiFactor * 100) / 100;
+      }
       data.push(point);
     }
-    return { chartData: data, spediteure: spedSet };
-  }, [entries, selectedRoute, selectedSize, selectedYear]);
+
+    const spediteureOut = showScfi ? [...spedSet, "SCFI"] : spedSet;
+    return { chartData: data, spediteure: spediteureOut };
+  }, [entries, selectedRoute, selectedSize, selectedYear, scfiByYear]);
 
   /* ---- file handling ---- */
   const handleFiles = async (fileList) => {
@@ -337,7 +469,7 @@ export default function FrachtratenDashboard() {
       try {
         const buf = await file.arrayBuffer();
         const wb = XLSX.read(buf, { type: "array" });
-        const { guessedMonth, routeCandidates } = parseWorkbook(wb, selectedYear);
+        const { guessedMonth, routeCandidates } = parseWorkbook(wb, file.name);
         if (routeCandidates.length === 0) {
           setError(`In "${file.name}" konnten keine Container-Preise erkannt werden. Bitte Struktur prüfen.`);
           continue;
@@ -743,8 +875,9 @@ export default function FrachtratenDashboard() {
                     key={sp}
                     type="monotone"
                     dataKey={sp}
-                    stroke={SPEDITEUR_COLORS[sp] || FALLBACK_COLORS[idx % FALLBACK_COLORS.length]}
+                    stroke={sp === "SCFI" ? SCFI_LINE_COLOR : SPEDITEUR_COLORS[sp] || FALLBACK_COLORS[idx % FALLBACK_COLORS.length]}
                     strokeWidth={2.5}
+                    strokeDasharray={sp === "SCFI" ? "6 4" : undefined}
                     dot={{ r: 3 }}
                     connectNulls
                   />
@@ -754,6 +887,63 @@ export default function FrachtratenDashboard() {
           </div>
         </div>
       )}
+
+      {/* SCFI-Referenzwerte */}
+      <div style={styles.card}>
+        <div style={styles.cardHeader}>SCFI-Referenzwerte (Standort China)</div>
+        <div style={{ fontSize: 12.5, color: "#9fb3c8", lineHeight: 1.5 }}>
+          Lade hier deine aktualisierte SCFI-Tabelle hoch (.csv oder .xlsx) — Format: Monat in
+          Spalte A, Jahre als Spaltenüberschriften (z. B. "Monat;2023;2024;2025;2026"). Vorhandene
+          Monate werden aktualisiert, neue Monate automatisch ergänzt, für alle Benutzer sichtbar.
+        </div>
+
+        <div
+          style={styles.dropzone}
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={onScfiDrop}
+          onClick={() => scfiFileInputRef.current?.click()}
+        >
+          <Upload size={20} color="#6FA8DC" />
+          <div style={{ fontSize: 13.5, color: "#cfe0ee" }}>
+            SCFI-Datei hierher ziehen oder <span style={{ color: "#6FA8DC", textDecoration: "underline" }}>auswählen</span>
+          </div>
+          <div style={{ fontSize: 11.5, color: "#6c8299" }}>.csv oder .xlsx</div>
+          <input
+            ref={scfiFileInputRef}
+            type="file"
+            accept=".csv,.xlsx,.xlsm"
+            style={{ display: "none" }}
+            onChange={(e) => { if (e.target.files?.length) handleScfiFile(e.target.files); e.target.value = ""; }}
+          />
+        </div>
+
+        {scfiSaving && <Spinner label="SCFI-Daten werden verarbeitet…" />}
+
+        {scfiError && (
+          <div style={styles.errorBox}>
+            <AlertCircle size={16} />
+            <span style={{ flex: 1, fontSize: 13 }}>{scfiError}</span>
+            <button onClick={() => setScfiError(null)} style={styles.iconBtn}><X size={14} /></button>
+          </div>
+        )}
+
+        {scfiSuccessMsg && (
+          <div style={styles.successBoxInline}>
+            <CheckCircle2 size={16} color="#7bd88f" />
+            <span style={{ fontSize: 13 }}>{scfiSuccessMsg}</span>
+          </div>
+        )}
+
+        <div style={{ fontSize: 11.5, color: "#7d92a6" }}>
+          {scfiLoading
+            ? "Lade aktuellen SCFI-Stand…"
+            : scfiRowCount > 0
+            ? `Aktuell ${scfiRowCount} Monatswerte hinterlegt${
+                scfiLastUpdated ? ` · zuletzt aktualisiert am ${new Date(scfiLastUpdated).toLocaleString("de-DE")}` : ""
+              }.`
+            : "Noch keine SCFI-Werte hinterlegt."}
+        </div>
+      </div>
 
       {/* Manage imports */}
       {uploads.length > 0 && (
@@ -908,6 +1098,10 @@ const styles = {
     position: "fixed", bottom: 20, left: "50%", transform: "translateX(-50%)",
     background: "#12251c", border: "1px solid #2c5c3f", borderRadius: 8,
     padding: "10px 16px", display: "flex", alignItems: "center", gap: 8, boxShadow: "0 4px 20px rgba(0,0,0,.4)",
+  },
+  successBoxInline: {
+    display: "flex", alignItems: "center", gap: 8, background: "#12251c",
+    border: "1px solid #2c5c3f", borderRadius: 8, padding: "8px 12px",
   },
 };
 
